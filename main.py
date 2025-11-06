@@ -25,6 +25,69 @@ st.set_page_config(page_title="Universal DB Chatbot", page_icon="🤖", layout="
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# ==================================================
+# SECURITY: SQL INJECTION & MODIFICATION PREVENTION
+# ==================================================
+
+def is_read_only_query(sql_query: str) -> tuple[bool, str]:
+    """
+    Validates that SQL query is read-only (SELECT only)
+    Returns: (is_valid, error_message)
+    """
+    if not sql_query:
+        return False, "Empty query"
+    
+    # Convert to uppercase for checking
+    sql_upper = sql_query.upper().strip()
+    
+    # List of forbidden keywords that modify data
+    forbidden_keywords = [
+        'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER',
+        'TRUNCATE', 'REPLACE', 'MERGE', 'GRANT', 'REVOKE',
+        'EXEC', 'EXECUTE', 'CALL', 'LOAD', 'RENAME'
+    ]
+    
+    # Check for forbidden keywords
+    for keyword in forbidden_keywords:
+        # Use word boundaries to avoid false positives
+        pattern = r'\b' + keyword + r'\b'
+        if re.search(pattern, sql_upper):
+            return False, f"⚠️ Security Alert: {keyword} operations are not allowed. This chatbot is read-only."
+    
+    # Ensure query starts with SELECT (after removing comments)
+    # Remove SQL comments
+    sql_no_comments = re.sub(r'--.*$', '', sql_upper, flags=re.MULTILINE)
+    sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
+    sql_no_comments = sql_no_comments.strip()
+    
+    if not sql_no_comments.startswith('SELECT'):
+        return False, "⚠️ Only SELECT queries are allowed. This chatbot cannot modify data."
+    
+    return True, ""
+
+
+def sanitize_user_input(user_input: str) -> str:
+    """
+    Sanitize user input to prevent injection attempts
+    """
+    # Remove potential SQL injection patterns
+    dangerous_patterns = [
+        r';\s*DROP',
+        r';\s*DELETE',
+        r';\s*UPDATE',
+        r';\s*INSERT',
+        r'UNION\s+SELECT',
+        r'--\s*$',
+        r'/\*.*?\*/',
+    ]
+    
+    cleaned = user_input
+    for pattern in dangerous_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    
+    return cleaned
+
+
 # --- DATABASE CONNECTION ---
 def get_db_connection():
     try:
@@ -127,6 +190,22 @@ def generate_sql_query_with_llm(user_query: str, schema_info: dict, llm, convers
     NO hardcoded patterns or templates!
     """
     
+    # Get custom directive if available
+    custom_directive = st.session_state.get('chatbot_directive', None)
+    directive_section = ""
+    if custom_directive:
+        directive_section = f"""
+{'='*50}
+CUSTOM CHATBOT DIRECTIVE:
+{'='*50}
+{custom_directive}
+
+IMPORTANT: Follow the directive above when interpreting user questions and generating responses.
+This directive defines your role, domain expertise, and behavioral guidelines.
+{'='*50}
+
+"""
+    
     # Build conversation context
     context = ""
     if conversation_history and len(conversation_history) > 1:
@@ -145,15 +224,25 @@ def generate_sql_query_with_llm(user_query: str, schema_info: dict, llm, convers
             context += f"{role}: {content}\n\n"
         
         context += "CRITICAL INSTRUCTIONS FOR FOLLOW-UP QUESTIONS:\n"
+        context += "- ALWAYS look at conversation history FIRST before determining confidence\n"
         context += "- If user says 'them/they/it/these/those', identify what entity they refer to from history\n"
         context += "- If user says 'each/all of them', determine which table/entities they mean\n"
-        context += "- If user asks 'where can I find X', identify location-related columns in the schema and JOIN as needed\n"
+        context += "- Single word responses like 'yes', 'no', 'sure' after a question = user agreeing/responding to assistant's previous question\n"
+        context += "- For single-word or short responses, check if assistant asked a question - if yes, confidence should be LOW (user needs to clarify)\n"
         context += "- If previous query showed a LIST of items, follow-ups likely refer to that list\n"
         context += "- If previous query showed SPECIFIC items, follow-ups refer to those items\n"
+        context += "- For vague follow-ups without clear intent, return confidence = 0.2 with reasoning asking for clarification\n"
         context += "="*50 + "\n"
     
     prompt = f"""You are an expert SQL query generator. Your task is to convert natural language questions into valid SQL queries based on the provided database schema.
 
+🔒 CRITICAL SECURITY REQUIREMENT:
+**YOU MUST ONLY GENERATE SELECT QUERIES - NO DATA MODIFICATION ALLOWED**
+- NEVER use INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, or any other data modification statements
+- If user asks to modify/delete/update/insert data, return confidence = 0.0 and explain this is a read-only chatbot
+- Your purpose is to RETRIEVE and ANALYZE data, not to modify it
+
+{directive_section}
 {schema_info['description']}
 
 RELATIONSHIPS:
@@ -161,20 +250,36 @@ RELATIONSHIPS:
 {context}
 USER QUESTION: "{user_query}"
 
+CONTEXT AWARENESS:
+- Analyze the conversation history carefully before setting confidence
+- If user's question is a short response (1-3 words) and assistant previously asked a question, this likely needs clarification
+- Don't assume vague responses have clear intent - ask for clarification instead
+- Check if the user is answering a previous question or asking a new question
+
 TASK:
 1. Analyze what the user is asking for
-2. **CRITICAL - CONTEXT RESOLUTION**: 
+2. **CRITICAL - SECURITY CHECK**: If the question asks to modify/delete/update/insert data, IMMEDIATELY return confidence = 0.0
+3. **CRITICAL - CONTEXT RESOLUTION**: 
    - If the user uses pronouns (it, they, them, their, these, those) or words like "each", "all of them", look at the conversation history
    - Identify WHAT SPECIFIC ENTITIES were discussed in the previous exchange
    - For questions with pronouns, resolve them to the specific items/entities from previous queries
    - If previous query returned a list, "them/these/those" refers to items in that list
    - If previous query was about specific entities, follow-up questions refer to those entities
-3. Determine which tables and columns are needed based on the schema provided
-4. Identify relevant entities by matching user's terms with table/column names and sample data
-5. Generate a valid SQL query to answer the question
-6. Include JOINs when data spans multiple related tables
-7. Use aggregation functions (COUNT, SUM, AVG, MAX, MIN) when appropriate
-8. Include WHERE, GROUP BY, ORDER BY, and LIMIT clauses as needed
+4. Determine which tables and columns are needed based on the schema provided
+5. Identify relevant entities by matching user's terms with table/column names and sample data
+6. Generate a valid SELECT-ONLY SQL query to answer the question
+7. Include JOINs when data spans multiple related tables
+8. Use aggregation functions (COUNT, SUM, AVG, MAX, MIN) when appropriate
+9. Include WHERE, GROUP BY, ORDER BY, and LIMIT clauses as needed
+
+COMMUNICATION RULES FOR REASONING:
+- NEVER mention "SQL query", "database query", "SELECT statement" or technical terms in reasoning
+- Instead use: "search for", "find", "retrieve information", "look up data"
+- If user provides insufficient context, reasoning should say: "I need more details to find what you're looking for. Could you please be more specific?"
+- If it's a vague follow-up (like just 'yes'), reasoning should say: "Your response 'yes' doesn't give me enough context. What specific information would you like me to find?"
+- Be conversational and user-friendly in all reasoning text
+- Example GOOD reasoning: "I need more details to find the specific films you're interested in"
+- Example BAD reasoning: "Cannot generate SQL query due to insufficient context"
 
 CRITICAL MATHEMATICAL CALCULATION RULES:
 **For questions about averages, totals, or aggregations involving master-detail relationships:**
@@ -196,11 +301,6 @@ CRITICAL MATHEMATICAL CALCULATION RULES:
   -- WRONG: Don't aggregate the detail records directly
   -- AGG_FUNCTION(value_col) or AGG_FUNCTION(quantity_col * value_col) from detail_table
   ```
-- **Common patterns requiring subqueries:**
-  - Average value per parent record (e.g., average transaction value, average project cost)
-  - Total value across all parent records where each has multiple detail records
-  - Maximum/minimum parent record value where value is sum of details
-  - Count of parent records meeting criteria based on aggregated detail values
 
 FOLLOW-UP QUERY PATTERNS:
 - "Which [entities] have them?" after listing items → JOIN items + relationships + related_entities WHERE item_id IN (previous results)
@@ -209,9 +309,11 @@ FOLLOW-UP QUERY PATTERNS:
 - "Where can I find it?" after showing a specific item → JOIN to get location/relationship info from related tables
 
 IMPORTANT RULES:
+- **ABSOLUTE RULE: Return ONLY SELECT queries - NEVER INSERT, UPDATE, DELETE, DROP, etc.**
 - Return ONLY valid SQL (MySQL syntax)
 - Use table and column names EXACTLY as shown in the schema above
 - **CRITICAL**: If the question asks for data that DOES NOT EXIST in any table/column in the schema, return confidence = 0.0 and set sql_query = null
+- **CRITICAL**: If the question asks to MODIFY data in any way, return confidence = 0.0 and explain read-only limitation
 - For text searches, use LIKE with wildcards: WHERE column LIKE '%search_term%'
 - Use CASE-INSENSITIVE matching: LOWER(column) LIKE LOWER('%search_term%')
 - **CRITICAL TEXT SEARCH STRATEGY**: When searching for concepts in text fields:
@@ -238,6 +340,7 @@ OUT-OF-SCOPE DETECTION:
 - If the question mentions concepts not present in any table/column → confidence = 0.0
 - If the question asks about data types (dates, amounts, statuses) that aren't in the schema → confidence = 0.0
 - If the question requires calculations on non-existent columns → confidence = 0.0
+- **If the question asks to modify/update/delete/insert data → confidence = 0.0 with "read-only" explanation**
 - For ANY question requiring data not present in the schema, return confidence = 0.0 with explanation in reasoning
 
 QUERY OPTIMIZATION:
@@ -249,6 +352,7 @@ QUERY OPTIMIZATION:
 ERROR HANDLING:
 - If the question is ambiguous, generate the most reasonable interpretation
 - **CRITICAL**: If the question asks for information that doesn't exist in the schema, return confidence = 0.0, sql_query = null, and explain what's missing
+- **CRITICAL**: If the question asks to modify data, return confidence = 0.0, sql_query = null, and explain read-only limitation
 - If required columns/tables are not available, DO NOT attempt to generate SQL - return low confidence instead
 
 RESPONSE FORMAT (JSON):
@@ -257,109 +361,6 @@ RESPONSE FORMAT (JSON):
     "reasoning": "Brief explanation of what this query does and why these tables/columns were chosen",
     "confidence": 0.0-1.0,
     "tables_used": ["table1", "table2"]
-}}
-
-EXAMPLES OF QUERY PATTERNS:
-
-Average Value from Master-Detail Relationship (CORRECT APPROACH):
-User: "What is the average value per parent record?" or "What's the average total?"
-{{
-    "sql_query": "SELECT AVG(parent_total) as average_value FROM (SELECT parent_id, SUM(quantity_col * value_col) as parent_total FROM detail_table GROUP BY parent_id) as totals",
-    "reasoning": "Calculating average by first computing the total value of each parent record (sum of quantity × value for all child records), then averaging those parent totals. This ensures we get the average per parent, not per child record.",
-    "confidence": 0.95,
-    "tables_used": ["detail_table"]
-}}
-
-Total Value Across All Records (CORRECT APPROACH):
-User: "What's the total value?" or "How much in total?"
-{{
-    "sql_query": "SELECT SUM(quantity_col * value_col) as total_value FROM detail_table",
-    "reasoning": "Calculating total value by multiplying quantity by value for each detail record and summing all results",
-    "confidence": 0.95,
-    "tables_used": ["detail_table"]
-}}
-
-Aggregated Value per Category (with JOIN):
-User: "What's the average value per category?"
-{{
-    "sql_query": "SELECT c.category_id, c.category_name, AVG(parent_total) as avg_value FROM categories c JOIN parent_table p ON c.category_id = p.category_id JOIN (SELECT parent_id, SUM(quantity_col * value_col) as parent_total FROM detail_table GROUP BY parent_id) d ON p.parent_id = d.parent_id GROUP BY c.category_id, c.category_name",
-    "reasoning": "First calculating total value per parent record, then joining with parent and category tables, finally grouping by category to get average value per category",
-    "confidence": 0.9,
-    "tables_used": ["categories", "parent_table", "detail_table"]
-}}
-
-Simple Count:
-User: "How many records are in [table]?"
-{{
-    "sql_query": "SELECT COUNT(*) as total FROM table_name",
-    "reasoning": "Counting all records in the specified table",
-    "confidence": 0.95,
-    "tables_used": ["table_name"]
-}}
-
-Search with Joins:
-User: "Where can I find [entity]?"
-{{
-    "sql_query": "SELECT t1.col1, t2.col2, t2.location_col FROM table1 t1 JOIN table2 t2 ON t1.id = t2.fk_id WHERE t1.name_col LIKE '%entity%'",
-    "reasoning": "Joining related tables to find location/relationship information for the specified entity",
-    "confidence": 0.9,
-    "tables_used": ["table1", "table2"]
-}}
-
-Aggregation with Sorting:
-User: "What's the highest/lowest [attribute]?"
-{{
-    "sql_query": "SELECT col1, col2, target_col FROM table_name ORDER BY target_col DESC LIMIT 1",
-    "reasoning": "Finding record with maximum value in target column",
-    "confidence": 0.95,
-    "tables_used": ["table_name"]
-}}
-
-Filtered Search:
-User: "Show me [items] that meet [criteria]"
-{{
-    "sql_query": "SELECT col1, col2, col3 FROM table_name WHERE condition1 AND condition2 ORDER BY relevant_col",
-    "reasoning": "Filtering records based on user criteria",
-    "confidence": 0.9,
-    "tables_used": ["table_name"]
-}}
-
-Text Pattern Search (Multiple Terms):
-User: "Show me [items with specific attribute]" (when sample data shows abbreviations)
-{{
-    "sql_query": "SELECT col1, col2, col3 FROM table_name WHERE (text_col LIKE '%full_term%' OR text_col LIKE '%abbreviation%') ORDER BY relevant_col",
-    "reasoning": "Searching using both full term and common abbreviation found in sample data. Using OR to catch all variations.",
-    "confidence": 0.9,
-    "tables_used": ["table_name"]
-}}
-
-Multi-Column Text Search:
-User: "Find items with [keyword]"
-{{
-    "sql_query": "SELECT col1, col2, col3 FROM table_name WHERE (name_col LIKE '%keyword%' OR description_col LIKE '%keyword%' OR category_col LIKE '%keyword%')",
-    "reasoning": "Searching across multiple text columns to find all matches for the keyword",
-    "confidence": 0.85,
-    "tables_used": ["table_name"]
-}}
-
-Follow-up with Pronoun Reference (Generic Pattern):
-Previous Query: User asked for items matching certain criteria
-Current Query: "Which [related_entities] have them?" or "Where can I find them?"
-{{
-    "sql_query": "SELECT t1.col, t2.related_col FROM table1 t1 JOIN table2 t2 ON t1.id = t2.fk_id WHERE t1.attribute [previous_filter_condition] ORDER BY relevant_col",
-    "reasoning": "User is asking about related entities for the items from the previous query. Applying the same filter condition from conversation history and joining to the related table they're asking about.",
-    "confidence": 0.85,
-    "tables_used": ["table1", "table2"]
-}}
-
-Follow-up with Collective Reference (Generic Pattern):
-Previous Query: User listed a set of entities
-Current Query: "How many/What [attribute] does each have?" or "Show details for each"
-{{
-    "sql_query": "SELECT entity_table.name, COUNT(related_table.id) as count FROM entity_table LEFT JOIN related_table ON entity_table.id = related_table.fk_id GROUP BY entity_table.id ORDER BY count DESC",
-    "reasoning": "User wants aggregated information for each entity that was listed in the previous response. Using GROUP BY to aggregate per entity.",
-    "confidence": 0.9,
-    "tables_used": ["entity_table", "related_table"]
 }}
 
 Now generate the SQL query for: "{user_query}"
@@ -397,47 +398,172 @@ Return ONLY the JSON response, no other text.
 # NATURAL LANGUAGE RESPONSE GENERATOR
 # ==================================================
 
+def clean_sql_results(sql_result: str) -> str:
+    """
+    Preprocesses raw SQL results to remove Python formatting artifacts
+    Converts Decimal objects, tuples, and other Python structures to clean text
+    """
+    import ast
+    from decimal import Decimal
+    
+    try:
+        # Try to parse the result as Python literal
+        parsed = ast.literal_eval(sql_result)
+        
+        cleaned_rows = []
+        
+        # Handle list of tuples (most common case)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, tuple):
+                    cleaned_items = []
+                    for value in item:
+                        if isinstance(value, (int, float)) or (hasattr(value, '__class__') and 'Decimal' in str(type(value))):
+                            # Convert to float for cleaner display
+                            cleaned_items.append(str(float(value)))
+                        elif isinstance(value, str):
+                            # Title case for names
+                            cleaned_items.append(value.title())
+                        else:
+                            cleaned_items.append(str(value))
+                    cleaned_rows.append(" | ".join(cleaned_items))
+        
+        # Return cleaned result as pipe-separated values
+        return "\n".join(cleaned_rows)
+    
+    except:
+        # If parsing fails, do regex-based cleaning
+        import re
+        
+        # Remove Decimal() wrappers
+        cleaned = re.sub(r"Decimal\('([^']+)'\)", r'\1', sql_result)
+        
+        # Remove extra quotes around strings
+        cleaned = re.sub(r"'([A-Z\s]+)'", r'\1', cleaned)
+        
+        # Convert to title case
+        def title_case_match(match):
+            return match.group(0).title()
+        
+        cleaned = re.sub(r'\b[A-Z]{2,}\b', title_case_match, cleaned)
+        
+        return cleaned
+
 def generate_natural_language_response(user_query: str, sql_result: str, llm) -> str:
     """
     Converts raw SQL results into natural, conversational language
     """
     
-    prompt = f"""You are a helpful assistant. Convert the database query results into a natural, conversational response.
+    # Get custom directive if available
+    custom_directive = st.session_state.get('chatbot_directive', None)
+    directive_section = ""
+    if custom_directive:
+        directive_section = f"""
+CUSTOM CHATBOT DIRECTIVE:
+{custom_directive}
+
+CRITICAL: Your response MUST align with the directive above. Adopt the specified role, tone, and domain expertise when crafting your answer.
+{'='*50}
+
+"""
+    
+    prompt = f"""{directive_section}You are a helpful assistant. Convert the database query results into a natural, conversational response.
 
 USER ASKED: "{user_query}"
 
 DATABASE RESULTS:
 {sql_result}
 
+CRITICAL FORMATTING REQUIREMENT 
+
+The DATABASE RESULTS below contain raw Python data structures (tuples, Decimal objects, lists, etc.).
+You MUST parse and format them into clean, human-readable text.
+
+**NEVER show raw data like:**
+- [('FILM_NAME', Decimal('4.99'), Decimal('9.99'))]
+- ('ACTOR', 'NAME')
+- Decimal('4.99')
+- Raw tuple or list notation
+
+**ALWAYS format as:**
+- Film/actor names in Title Case with proper spacing
+- Numbers as clean values: $4.99 (not Decimal('4.99'))
+- Present data in organized lists, tables, or paragraphs
+- Remove ALL Python syntax (parentheses, quotes, Decimal(), brackets, commas between values)
+
+FORMATTING EXAMPLES:
+
+RAW: [('CONTROL ANTHEM', Decimal('4.99'), Decimal('9.99'), Decimal('0.499499'))]
+CORRECT: "Control Anthem has a rental rate of $4.99 and replacement cost of $9.99, with a ratio of 0.50"
+
+RAW: [('HORROR',), ('ACTION',), ('COMEDY',)]
+CORRECT: "The categories are Horror, Action, and Comedy"
+
+RAW: [('TOM', 'HANKS'), ('MEG', 'RYAN')]
+CORRECT: "Tom Hanks and Meg Ryan"
+
+---
+
 INSTRUCTIONS:
-1. Write a natural, friendly response as if you're talking to someone who asked a question
-2. Format any monetary values with appropriate currency symbols (e.g.,₹, $, €, £)
-3. Present exact values from the results without modification or rounding unless specifically asked
-4. Use bullet points or numbered lists for multiple items
-5. Include all relevant details from the query results
-6. If no results found, politely say so and suggest the user try rephrasing
-7. If there are multiple options, present them clearly and organized
-8. Be concise but thorough - provide complete information when multiple details are returned
-9. For numerical data, provide context (e.g., "23 records found" not just "23")
-10. For comparisons, highlight the differences clearly
-11. Use appropriate formatting: bold for emphasis, tables for structured data when helpful
+
+1. Parse ALL raw database output - Never display raw Python data structures
+2. Write a natural, friendly response as if you're talking to someone who asked a question
+3. CRITICAL DATA CONVERSION:
+   - Convert Decimal('X.XX') to clean numbers: $X.XX for money, X.XX for ratios/decimals
+   - Convert ('FIRST', 'LAST') to "First Last" (Title Case with space)
+   - Convert ('SINGLE_VALUE',) to "Single Value"
+   - Remove all parentheses, quotes, brackets, and technical notation
+4. Format monetary values with appropriate currency symbols (e.g., ₹, $, €, £)
+5. Present exact values from the results without modification or rounding unless specifically asked
+6. Use bullet points, numbered lists, or tables for multiple items:
+   - For 2-5 items: Use bullet points
+   - For 6+ items: Use numbered list or markdown table
+   - For items with multiple fields: Use formatted table
+7. Include all relevant details from the query results
+8. If no results found, politely say so and suggest the user try rephrasing
+9. Be concise but thorough - provide complete information when multiple details are returned
+10. For numerical data, provide context (e.g., "23 films found" not just "23")
+11. For comparisons, highlight the differences clearly
+12. Names and Text Formatting:
+    - Format all names in Title Case (e.g., "John Smith" not "JOHN SMITH" or "('JOHN', 'SMITH')")
+    - Remove database formatting artifacts (parentheses, quotes, commas between name parts)
+    - For categories/genres, use proper capitalization (e.g., "Action" not "ACTION")
+    - Join multi-part names with spaces (first name + last name)
+13. NEVER use technical database terms like "SQL", "query", "SELECT", "JOIN", "tuple", "Decimal" in your response
+14. Speak naturally as if explaining to a non-technical person
+15. If you cannot provide an answer, politely ask for clarification without mentioning technical limitations
+16. For complex data with multiple fields per record:
+    - Create a formatted markdown table OR
+    - Use numbered list with clear labels
+    - Example: "1. Control Anthem - Rental: $4.99, Replacement: $9.99, Ratio: 0.50"
 
 ACCURACY RULES:
-- **NEVER add information not present in the database results**
-- **NEVER make calculations or assumptions beyond what the data shows**
-- **NEVER invent column values, dates, or details that aren't in the results**
+- NEVER add information not present in the database results
+- NEVER make calculations or assumptions beyond what the data shows
+- NEVER invent column values, dates, or details that aren't in the results
 - If a field is NULL or missing, say "Not specified" or "Not available"
-- Quote exact numbers and values from the results
+- Quote exact numbers and values from the results (after converting from Decimal format)
 - If showing quantities or counts, be precise
 - Reference the actual data returned, don't make assumptions
 - If the results are empty or insufficient to answer fully, acknowledge this limitation
 - DO NOT fabricate data to make the answer sound better
+
+DATA PRESENTATION RULES:
+- PRIMARY RULE: Convert ALL database tuples and Decimal objects to natural language
+- Example: [('TOM', 'HANKS'), ('MEG', 'RYAN')] → "Tom Hanks and Meg Ryan"
+- Example: [('ACTION',), ('COMEDY',)] → "Action and Comedy"
+- Example: Decimal('4.99') → $4.99 or 4.99 (depending on context)
+- Example: [('FILM', Decimal('4.99'), Decimal('19.99'))] → "Film - Rental: $4.99, Cost: $19.99"
+- Always format names and categories in readable Title Case format
+- Remove all technical database formatting (quotes, parentheses, tuple notation, Decimal())
+- For ratios or percentages, format as: 0.50 or 50% (whichever is more natural)
 
 TONE:
 - Professional but friendly
 - Helpful and informative
 - Objective - stick to the facts from the database
 - Acknowledge when information is incomplete or unavailable
+- Never sound robotic or technical
 
 RESPONSE:"""
     
@@ -455,11 +581,16 @@ RESPONSE:"""
 def process_user_query(user_query: str) -> str:
     """
     Complete pipeline:
-    1. Get schema automatically
-    2. Generate SQL with LLM (no templates)
-    3. Execute query
-    4. Convert to natural language
+    1. Sanitize input
+    2. Get schema automatically
+    3. Generate SQL with LLM (no templates)
+    4. Validate SQL is read-only
+    5. Execute query
+    6. Convert to natural language
     """
+    
+    # Step 0: Sanitize user input
+    sanitized_query = sanitize_user_input(user_query)
     
     # Initialize
     db_config = st.session_state.get('db_config')
@@ -478,7 +609,7 @@ def process_user_query(user_query: str) -> str:
     try:
         # Step 1: Generate SQL query using LLM with conversation history
         query_info = generate_sql_query_with_llm(
-            user_query, 
+            sanitized_query, 
             schema_info, 
             llm,
             conversation_history=st.session_state.messages
@@ -489,22 +620,29 @@ def process_user_query(user_query: str) -> str:
         reasoning = query_info.get('reasoning', '')
         
         print(f"\n{'='*50}")
-        print(f"USER QUERY: {user_query}")
+        print(f"USER QUERY: {sanitized_query}")
         print(f"REASONING: {reasoning}")
         print(f"CONFIDENCE: {confidence}")
         print(f"GENERATED SQL: {sql_query}")
         print(f"{'='*50}\n")
         
-        # Step 2: Execute query if confidence is reasonable
+        # Step 2: Security validation - Check if query is read-only
+        if sql_query:
+            is_valid, error_msg = is_read_only_query(sql_query)
+            if not is_valid:
+                return f"🔒 {error_msg}\n\nI can only help you **retrieve and analyze** data, not modify it. Please ask a question about viewing or analyzing your database information."
+        
+        # Step 3: Execute query if confidence is reasonable
         if sql_query and confidence > 0.4:
             try:
                 sql_result = db.run(sql_query)
                 
-                # Step 3: Convert to natural language
+                # Step 4: Convert to natural language
                 if sql_result and sql_result.strip() and sql_result != "[]":
+                    cleaned_result = clean_sql_results(sql_result)
                     natural_response = generate_natural_language_response(
-                        user_query, 
-                        sql_result, 
+                        sanitized_query, 
+                        cleaned_result, 
                         llm
                     )
                     return natural_response
@@ -513,14 +651,19 @@ def process_user_query(user_query: str) -> str:
                     
             except Exception as sql_error:
                 print(f"SQL Execution Error: {sql_error}")
-                return fallback_to_sql_agent(user_query, db, llm)
+                return fallback_to_sql_agent(sanitized_query, db, llm)
         
         else:
             # Low confidence or out-of-scope query
             if confidence == 0.0:
-                return f"I apologize, but I cannot answer that question. {reasoning}\n\nThe available database contains information about: {', '.join(schema_info['tables'].keys())}. Please ask a question related to this data."
-            else:
-                return fallback_to_sql_agent(user_query, db, llm)
+                # Check if it's a modification request
+                if any(keyword in reasoning.lower() for keyword in ['modify', 'update', 'delete', 'insert', 'change', 'remove']):
+                    return f"🔒 **Security Notice:** This chatbot is read-only and cannot modify database contents.\n\n{reasoning}\n\nI can help you view and analyze data. What would you like to know about your database?"
+                else:
+                    clean_reasoning = reasoning.replace("SQL query", "search").replace("generate", "find").replace("database query", "information")
+                    return f"I apologize, but I need more information. {clean_reasoning}\n\nWhat would you like to know?"
+            elif confidence < 0.4:
+                return "I'm not quite sure what you're asking for. Could you please provide more details or rephrase your question?"
             
     except Exception as e:
         print(f"Processing Error: {e}")
@@ -541,8 +684,19 @@ def fallback_to_sql_agent(user_query: str, db: SQLDatabase, llm) -> str:
             max_iterations=10
         )
         
-        result = agent.invoke({"input": user_query})
-        return result.get("output", "I couldn't process that request. Please try rephrasing.")
+        # Add security instruction to agent
+        secure_query = f"[READ-ONLY MODE] {user_query}. Only generate SELECT queries."
+        result = agent.invoke({"input": secure_query})
+        
+        # Double-check the agent didn't generate modification queries
+        output = result.get("output", "")
+        # Clean any raw SQL results in agent output
+        if "[(" in output or "Decimal(" in output:
+            output = clean_sql_results(output)
+        if any(keyword in output.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER']):
+            return "🔒 Security Alert: Cannot execute data modification queries. This chatbot is read-only."
+        
+        return output if output else "I couldn't process that request. Please try rephrasing."
     except Exception as e:
         print(f"Agent Error: {e}")
         return "I'm having trouble understanding that question. Could you rephrase it?"
@@ -558,6 +712,8 @@ if 'db_config' not in st.session_state:
     st.session_state.db_config = None
 if 'db_connected' not in st.session_state:
     st.session_state.db_connected = False
+if 'chatbot_directive' not in st.session_state:
+    st.session_state.chatbot_directive = None
 
 
 # ==================================================
@@ -572,9 +728,18 @@ def show_database_connection_sidebar():
             st.success(f"✅ Connected to: {st.session_state.db_config['database']}")
             st.info(f"**Host:** {st.session_state.db_config['host']}\n**User:** {st.session_state.db_config['user']}")
             
+            # Security notice
+            st.warning("🔒 **Read-Only Mode**: This chatbot can only view data, not modify it.")
+            
+            # Show current directive
+            if st.session_state.chatbot_directive:
+                with st.expander("📋 Current Directive", expanded=False):
+                    st.write(st.session_state.chatbot_directive)
+            
             if st.button("🔄 Change Database", use_container_width=True):
                 st.session_state.db_connected = False
                 st.session_state.db_config = None
+                st.session_state.chatbot_directive = None
                 st.session_state.messages = []
                 # Clear cache when switching databases
                 get_db_chain.clear()
@@ -591,6 +756,15 @@ def show_database_connection_sidebar():
                 user = st.text_input("Username", value="root", help="Database username")
                 password = st.text_input("Password", type="password", help="Database password")
                 database = st.text_input("Database Name", help="Name of the database to connect to")
+                
+                st.divider()
+                st.subheader("🎯 Chatbot Directive")
+                directive = st.text_area(
+                    "Custom Behavior Directive (Optional)",
+                    placeholder="Example: Behave as a medical hospital chatbot that helps extract patient information, appointment schedules, and medical records from the database. Always maintain HIPAA compliance and patient privacy in responses.",
+                    help="Define how you want the chatbot to behave and respond. This will guide the chatbot's tone, focus, and domain expertise.",
+                    height=120
+                )
                 
                 submitted = st.form_submit_button("🔗 Connect", use_container_width=True)
                 
@@ -615,9 +789,16 @@ def show_database_connection_sidebar():
                             # If successful, save to session state
                             st.session_state.db_config = test_config
                             st.session_state.db_connected = True
+                            st.session_state.chatbot_directive = directive.strip() if directive.strip() else None
+                            
+                            welcome_msg = f"✅ Successfully connected to **{database}**!"
+                            if st.session_state.chatbot_directive:
+                                welcome_msg += f"\n\n🎯 **Active Directive:** {st.session_state.chatbot_directive[:100]}..."
+                            welcome_msg += "\n\nAsk me anything about your data!"
+                            
                             st.session_state.messages = [{
                                 "role": "assistant",
-                                "content": f"✅ Successfully connected to **{database}**! Ask me anything about your data."
+                                "content": welcome_msg
                             }]
                             st.success(f"✅ Successfully connected to {database}!")
                             st.rerun()
@@ -635,7 +816,7 @@ show_database_connection_sidebar()
 
 # Main chatbot interface
 st.title("🤖 Universal Database Chatbot")
-st.caption("Zero hardcoding - Works with any database!")
+st.caption("🔒 Secure read-only access - Zero hardcoding - Works with any database!")
 
 if st.session_state.db_connected:
     st.info(f"💬 Connected to: **{st.session_state.db_config['database']}** | Ask me anything!")
