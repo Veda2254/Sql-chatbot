@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 Universal Database Chatbot</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <!-- Marked.js for markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-content">
+                <h2 class="sidebar-title">🔌 Database Connection</h2>
+                
+                <!-- Connection Status -->
+                <div id="connectionStatus" class="status-box status-disconnected">
+                    <span class="status-icon">⚠️</span>
+                    <span class="status-text">No database connected</span>
+                </div>
+                
+                <!-- Connected Info -->
+                <div id="connectedInfo" class="connected-info" style="display: none;">
+                    <div class="info-item">
+                        <strong>Database:</strong> <span id="connectedDatabase">-</span>
+                    </div>
+                    <div class="info-item">
+                        <strong>Host:</strong> <span id="connectedHost">-</span>
+                    </div>
+                    <div class="info-item">
+                        <strong>User:</strong> <span id="connectedUser">-</span>
+                    </div>
+                    
+                    <div class="security-notice">
+                        🔒 <strong>Read-Only Mode:</strong> This chatbot can only view data, not modify it.
+                    </div>
+                    
+                    <!-- Current Directive Display -->
+                    <div id="currentDirectiveBox" class="directive-display" style="display: none;">
+                        <details>
+                            <summary>📋 Current Directive</summary>
+                            <p id="currentDirectiveText"></p>
+                        </details>
+                    </div>
+                    
+                    <button id="changeDbBtn" class="btn btn-secondary">🔄 Change Database</button>
+                </div>
+                
+                <!-- Connection Form -->
+                <form id="connectionForm" class="connection-form">
+                    <h3>Connect to MySQL Database</h3>
+                    
+                    <div class="form-group">
+                        <label for="host">Host *</label>
+                        <input type="text" id="host" name="host" value="localhost" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="port">Port</label>
+                        <input type="number" id="port" name="port" value="3306" min="1" max="65535">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="user">Username *</label>
+                        <input type="text" id="user" name="user" value="root" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="database">Database Name *</label>
+                        <input type="text" id="database" name="database" required>
+                    </div>
+                    
+                    <hr>
+                    
+                    <h3>🎯 Chatbot Directive</h3>
+                    <div class="form-group">
+                        <label for="directive">Custom Behavior Directive (Optional)</label>
+                        <textarea id="directive" name="directive" rows="5" placeholder="Example: Behave as a medical hospital chatbot that helps extract patient information, appointment schedules, and medical records from the database. Always maintain HIPAA compliance and patient privacy in responses."></textarea>
+                        <small>Define how you want the chatbot to behave and respond. This will guide the chatbot's tone, focus, and domain expertise.</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">🔗 Connect</button>
+                </form>
+            </div>
+        </aside>
+        
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="header">
+                <h1>🤖 Universal Database Chatbot</h1>
+                <p class="subtitle">🔒 Secure read-only access - Zero hardcoding - Works with any database!</p>
+            </header>
+            
+            <!-- Info Banner -->
+            <div id="infoBanner" class="info-banner">
+                ⚠️ Please connect to a database using the sidebar before asking questions.
+            </div>
+            
+            <!-- Chat Messages -->
+            <div id="chatMessages" class="chat-messages">
+                <!-- Messages will be dynamically added here -->
+            </div>
+            
+            <!-- Chat Input -->
+            <div class="chat-input-container">
+                <div class="chat-input-wrapper">
+                    <input 
+                        type="text" 
+                        id="chatInput" 
+                        placeholder="Ask me anything about the data..." 
+                        disabled
+                    >
+                    <button id="sendBtn" class="btn-send" disabled>
+                        <span class="send-icon">➤</span>
+                    </button>
+                </div>
+                <button id="clearChatBtn" class="btn-clear" style="display: none;">
+                    🗑️ Clear Chat History
+                </button>
+            </div>
+        </main>
+    </div>
+    
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+        <div class="loading-spinner"></div>
+        <p>Processing your request...</p>
+    </div>
+    
+    <!-- Toast Notifications -->
+    <div id="toastContainer" class="toast-container"></div>
+    
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>

@@ -1,4 +1,10 @@
-streamlit
+# Flask and extensions
+flask
+flask-cors
+flask-session
+flask-caching
+
+# Core dependencies
 python-dotenv
 groq
 langchain
